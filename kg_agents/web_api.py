@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from threading import Lock
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
@@ -24,6 +25,9 @@ class AskResponse(BaseModel):
     attached_files: list[str] = Field(default_factory=list)
 
 
+_runtime_lock = Lock()
+
+
 def _allowed_origins() -> list[str]:
     configured = os.environ.get("WEB_ALLOWED_ORIGINS", "").strip()
     if configured:
@@ -38,17 +42,12 @@ def _allowed_origins() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    runtime: AgentRuntime | None = None
     app.state.runtime = None
     app.state.startup_error = None
     try:
-        runtime = create_runtime()
-        app.state.runtime = runtime
-    except Exception as exc:  # pragma: no cover - runtime depends on local credentials/services
-        app.state.startup_error = str(exc)
-    try:
         yield
     finally:
+        runtime: AgentRuntime | None = getattr(app.state, "runtime", None)
         if runtime is not None:
             runtime.close()
 
@@ -75,8 +74,29 @@ def _get_runtime() -> AgentRuntime:
 
     runtime = getattr(app.state, "runtime", None)
     if runtime is None:
-        raise HTTPException(status_code=503, detail="Backend runtime is not ready yet.")
+        with _runtime_lock:
+            runtime = getattr(app.state, "runtime", None)
+            if runtime is None:
+                try:
+                    runtime = create_runtime()
+                except Exception as exc:  # pragma: no cover - depends on local credentials/services
+                    app.state.startup_error = str(exc)
+                    raise HTTPException(status_code=500, detail=f"Backend startup failed: {exc}") from exc
+                app.state.runtime = runtime
     return runtime
+
+
+@app.get("/")
+def root() -> dict[str, object]:
+    startup_error = getattr(app.state, "startup_error", None)
+    runtime_ready = getattr(app.state, "runtime", None) is not None
+    return {
+        "service": "T-Rex ISR Agent API",
+        "ok": startup_error is None,
+        "runtime_ready": runtime_ready,
+        "startup_error": startup_error,
+        "routes": ["/health", "/ask"],
+    }
 
 
 @app.get("/health")
@@ -84,6 +104,7 @@ def healthcheck() -> dict[str, object]:
     startup_error = getattr(app.state, "startup_error", None)
     return {
         "ok": startup_error is None,
+        "runtime_ready": getattr(app.state, "runtime", None) is not None,
         "startup_error": startup_error,
     }
 
