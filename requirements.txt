@@ -1,0 +1,16 @@
+python-dotenv
+neo4j
+openai
+sentence-transformers
+scikit-learn
+pandas
+mlxtend
+langgraph
+pydantic
+numpy
+networkx
+fastapi
+uvicorn
+pypdf
+python-multipart
+gunicorn
