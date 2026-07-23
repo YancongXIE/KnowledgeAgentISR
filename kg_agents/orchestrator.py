@@ -9,24 +9,25 @@ from langgraph.graph import END, START, StateGraph
 from neo4j import Driver
 from pydantic import BaseModel, Field, ValidationError
 from .analyzing_agent import AnalyzingAgent
+from .elicitation_agent import ElicitationAgent
 from .extraction_agent import ExtractionAgent
 from .graph_query_agent import GraphQueryAgent
-from .integration_agent import IntegrationAgent
+from .integration_agent import IntegrationAgent, render_knowledge_package_markdown
+from .internalization_agent import InternalizationAgent
 from .llm_json import complete_json
-from .models import RetrievalPlan
+from .models import IntegrationState, RetrievalPlan
+from .reflection_agent import ReflectionAgent
 from .schema_agent import SchemaAgent
+from .session_store import GLOBAL_SESSION_STORE, SessionStore
 from .state import AgentState
 from .summarizing_agent import SummarizingAgent
+from .vicarious_learning_agent import VicariousLearningAgent
 
 logger = logging.getLogger(__name__)
 
 class _PdfChunkFocusJson(BaseModel):
     retrieval_instruction: str = Field(description='Natural-language instruction for the next PDF/chunk vector retrieval pass')
     rationale: str = Field(default='', description='Why this PDF focus helps answer the question')
-
-class _CheckpointSufficiencyJson(BaseModel):
-    sufficient: bool = Field(description="True only if the evidence below is enough to answer the user's question adequately.")
-    rationale: str = Field(default='', description='One or two sentences; reference the question.')
 
 class _AnalysisSelectionJson(BaseModel):
     selected_analyses: List[str] = Field(default_factory=list, description='Ordered candidate analysis function_name values; first item is the next step.')
@@ -129,6 +130,10 @@ class OrchestratorResult:
     answer: str
     state: AgentState
     iterations_used: int
+    status: str = 'complete'
+    session_id: Optional[str] = None
+    clarifying_questions: Optional[List[str]] = None
+    collaboration_prompt: Optional[str] = None
 
 class GraphState(TypedDict, total=False):
     question: str
@@ -163,11 +168,42 @@ class GraphState(TypedDict, total=False):
     current_objective: str
     selected_levels: List[str]
     use_kg: bool
+    research_intent: Optional[Dict[str, Any]]
+    integration_state: Optional[Dict[str, Any]]
+    reflection: Optional[Dict[str, Any]]
+    vicarious: Optional[Dict[str, Any]]
+    knowledge_package: Optional[Dict[str, Any]]
+    recommended_analyses: List[str]
+    interactive: bool
+    pause_status: Optional[str]
+    resume_from: Optional[str]
+    cycle_knowledge_packages: List[Dict[str, Any]]
+    current_cycle_package: Optional[Dict[str, Any]]
+    agent_memories: List[Dict[str, Any]]
+    internalization_result: Optional[Dict[str, Any]]
+    human_feedback: Optional[str]
+    collaboration_prompt: Optional[str]
+    await_human_gate: bool
 
 class KGMultiAgentOrchestrator:
-    ACTION_CATALOG: Dict[str, str] = {'plan_kg_from_context': 'Decide KG retrieval focus from current context', 'run_kg_query': 'Execute read-only Cypher against KG', 'run_analysis': 'Run analysis capabilities on KG query results', 'plan_pdf_from_kg': 'Decide next PDF chunk focus from KG results', 'pdf_refine': 'Vector-retrieve chunks using KG-informed instruction', 'summarize_answer': 'Summarize evidence and produce final answer'}
+    ACTION_CATALOG: Dict[str, str] = {
+        'elicit': 'Infer structured research intent from the human prompt',
+        'plan_kg_from_context': 'Decide KG retrieval focus from current context (Extraction Pipeline)',
+        'run_kg_query': 'Execute read-only Cypher against KG (Extraction Pipeline)',
+        'run_analysis': 'Run analysis capabilities on KG query results (Extraction Pipeline)',
+        'plan_pdf_from_kg': 'Decide next PDF chunk focus from KG results (Extraction Pipeline)',
+        'pdf_refine': 'Vector-retrieve chunks using KG-informed instruction (Extraction Pipeline)',
+        'build_cycle_knowledge_package': 'Assemble intermediate Knowledge Package for this extraction cycle',
+        'integrate_state': 'Synthesize IntegrationState across salient evidence',
+        'reflect': 'Decide whether another extraction cycle is worthwhile',
+        'vicarious_learning': 'Retrieve qualitative readings for human internalization',
+        'build_knowledge_package': 'Assemble the final Knowledge Package',
+        'internalize': 'Persist co-constructed knowledge into AgentMemory (RAG internalization)',
+        'summarize_answer': 'Lightweight evidence summary (baseline / package input)',
+        'pause_exit': 'Exit graph while waiting for human clarification or collaboration feedback',
+    }
     ANALYSIS_CAPABILITIES: Dict[str, List[Dict[str, str]]] = {'concept': [{'function_name': 'related_publications', 'description': 'This function identifies the publications that are related to the concept.'}, {'function_name': 'definitions', 'description': 'This function identifies the definitions of the concept.'}, {'function_name': 'definition_similarity', 'description': 'This function calculates the similarity score among concept definitions.'}, {'function_name': 'related_theories', 'description': 'This function identifies the theories that are related to the concept.'}], 'relationship': [{'function_name': 'antecedents_consequents', 'description': 'This function identifies the antecedents and consequents of a concept.'}, {'function_name': 'mediators_moderators', 'description': 'This function identifies the mediators and moderators of a relationship.'}, {'function_name': 'indegreecentrality', 'description': 'This function calculates the indegree centrality of a concept. Higher indegree centrality indicates more incoming connections, and popular consequents.'}, {'function_name': 'outdegreecentrality', 'description': 'This function calculates the outdegree centrality of a concept. Higher outdegree centrality indicates more outgoing connections, and fundamental antecedents.'}, {'function_name': 'betweennesscentrality', 'description': 'This function calculates the betweenness centrality of a concept. Higher betweenness centrality indicates influence as a bridge between other concepts.'}, {'function_name': 'cutpoints', 'description': 'This function identifies the cutpoints of a relationship. Cutpoints are concepts that, if removed, would disconnect the graph.'}, {'function_name': 'periphery', 'description': 'This function identifies the periphery index of a concept. Higher periphery index indicates concepts are close to the edge of the graph and more peripheral or innovative.'}, {'function_name': 'structural_hole_measures', 'description': 'This function calculates the structural hole measures of a concept. Constraint and effective size are calculated.'}, {'function_name': 'association_rules', 'description': 'This function identifies concepts tend to occur together in the same conceptual model.'}, {'function_name': 'knowledge_index', 'description': 'Knowledge index (KI) reflects conceptual convergence. Higher KI values mean antecedent paths are more convergent. A few antecedent paths dominate the explanation of focal dependent concept.Lower KI values mean antecedent paths are more divergent.'}]}
-    _MEMO_ANCHOR_PREFIXES: tuple[str, ...] = ('[analysis_queue_seed]', '[select_analysis]', '[cycle_objective]', '[checkpoint]')
+    _MEMO_ANCHOR_PREFIXES: tuple[str, ...] = ('[analysis_queue_seed]', '[select_analysis]', '[cycle_objective]', '[checkpoint]', '[elicitation]', '[reflection]')
 
     @classmethod
     def _function_name_to_level(cls) -> Dict[str, str]:
@@ -193,7 +229,7 @@ class KGMultiAgentOrchestrator:
                 seen.append(lv)
         return [x for x in order if x in seen]
 
-    def __init__(self, driver: Driver, llm_client: Any, embed_fn: Callable[[List[str]], List[List[float]]], *, model: str='gpt-5.2', max_iterations: int=4, max_cycles: int=4, default_candidate_pool: int=100, log_progress: bool=False, log_sink: Optional[Callable[[str], None]]=None, use_kg: bool=True) -> None:
+    def __init__(self, driver: Driver, llm_client: Any, embed_fn: Callable[[List[str]], List[List[float]]], *, model: str='gpt-5.2', max_iterations: int=4, max_cycles: int=4, default_candidate_pool: int=100, log_progress: bool=False, log_sink: Optional[Callable[[str], None]]=None, use_kg: bool=True, session_store: Optional[SessionStore]=None) -> None:
         self._driver = driver
         self._embed_fn = embed_fn
         self._max_iterations = max_iterations
@@ -204,6 +240,7 @@ class KGMultiAgentOrchestrator:
         self._llm_client = llm_client
         self._model = model
         self._use_kg = bool(use_kg)
+        self._session_store = session_store or GLOBAL_SESSION_STORE
         self.schema = SchemaAgent()
         self.graph_query = GraphQueryAgent(llm_client, self.schema, model=model)
         self.extraction = ExtractionAgent(embed_fn)
@@ -211,6 +248,10 @@ class KGMultiAgentOrchestrator:
         self.analyzing = AnalyzingAgent(embed_fn, driver=driver, curation_id=str(_curation))
         self.summarizing = SummarizingAgent(llm_client, model=model)
         self.integration = IntegrationAgent(llm_client, model=model)
+        self.elicitation = ElicitationAgent(llm_client, model=model)
+        self.reflection_agent = ReflectionAgent(llm_client, model=model)
+        self.vicarious = VicariousLearningAgent(llm_client, self.extraction, model=model)
+        self.internalization = InternalizationAgent(driver)
         self._graph = self._build_graph()
 
     def _emit(self, message: str) -> None:
@@ -239,15 +280,270 @@ class KGMultiAgentOrchestrator:
             return a
         return f'Question: {q}\nAnswer: {a}'
 
-    def _initial_graph_state(self, *, question: str, question_embedding: Optional[List[float]], use_kg: bool) -> GraphState:
-        return {'question': question, 'question_embedding': question_embedding, 'scratchpad': [], 'available_actions': list(self.ACTION_CATALOG.keys()), 'selected_actions': [], 'completed_actions': [], 'interpretation': None, 'retrieval_plan': None, 'last_cypher': None, 'last_records': [], 'extracted_records': [], 'last_error': None, 'analysis_report': None, 'analysis_note': None, 'evidence_summary': None, 'summary_cited_dois': [], 'integration_memo': '', 'integration_trace': [], 'iteration': 0, 'extra': None, 'continue_loop': True, 'final_answer': None, 'integration_note': '', 'pdf_focus_instruction': None, 'cycle_index': 0, 'selected_analyses': [], 'analysis_queue': [], 'analysis_step': 0, 'stop_gathering': False, 'use_kg': use_kg}
+    def _initial_graph_state(self, *, question: str, question_embedding: Optional[List[float]], use_kg: bool, interactive: bool = False) -> GraphState:
+        memories: List[Dict[str, Any]] = []
+        try:
+            memories = self.internalization.retrieve(
+                question_embedding=question_embedding,
+                top_k=3,
+                query_text=question,
+            )
+        except Exception as exc:
+            logger.debug('AgentMemory retrieve at start failed: %s', exc)
+        return {
+            'question': question,
+            'question_embedding': question_embedding,
+            'scratchpad': [],
+            'available_actions': list(self.ACTION_CATALOG.keys()),
+            'selected_actions': [],
+            'completed_actions': [],
+            'interpretation': None,
+            'retrieval_plan': None,
+            'last_cypher': None,
+            'last_records': [],
+            'extracted_records': [],
+            'last_error': None,
+            'analysis_report': None,
+            'analysis_note': None,
+            'evidence_summary': None,
+            'summary_cited_dois': [],
+            'integration_memo': '',
+            'integration_trace': [],
+            'iteration': 0,
+            'extra': None,
+            'continue_loop': True,
+            'final_answer': None,
+            'integration_note': '',
+            'pdf_focus_instruction': None,
+            'cycle_index': 0,
+            'selected_analyses': [],
+            'analysis_queue': [],
+            'analysis_step': 0,
+            'stop_gathering': False,
+            'use_kg': use_kg,
+            'research_intent': None,
+            'integration_state': None,
+            'reflection': None,
+            'vicarious': None,
+            'knowledge_package': None,
+            'recommended_analyses': [],
+            'interactive': bool(interactive),
+            'pause_status': None,
+            'resume_from': None,
+            'cycle_knowledge_packages': [],
+            'current_cycle_package': None,
+            'agent_memories': memories,
+            'internalization_result': None,
+            'human_feedback': None,
+            'collaboration_prompt': None,
+            'await_human_gate': False,
+        }
 
-    def _run_single(self, *, question: str, question_embedding: Optional[List[float]], use_kg: bool) -> OrchestratorResult:
-        initial_state = self._initial_graph_state(question=question, question_embedding=question_embedding, use_kg=use_kg)
+    @staticmethod
+    def _effective_question(state: GraphState) -> str:
+        intent = state.get('research_intent') or {}
+        refined = intent.get('refined_question') if isinstance(intent, dict) else None
+        if isinstance(refined, str) and refined.strip():
+            return refined.strip()
+        return (state.get('question') or '').strip()
+
+    def _run_single(self, *, question: str, question_embedding: Optional[List[float]], use_kg: bool, interactive: bool = False, initial_overrides: Optional[Dict[str, Any]] = None) -> OrchestratorResult:
+        initial_state = self._initial_graph_state(
+            question=question,
+            question_embedding=question_embedding,
+            use_kg=use_kg,
+            interactive=interactive,
+        )
+        if initial_overrides:
+            initial_state.update(initial_overrides)
         final_graph_state = self._graph.invoke(initial_state)
+        return self._result_from_graph_state(final_graph_state, interactive=interactive, use_kg=use_kg)
+
+    def _result_from_graph_state(
+        self,
+        final_graph_state: Dict[str, Any],
+        *,
+        interactive: bool,
+        use_kg: bool,
+        compare_baseline: bool = False,
+        existing_session_id: Optional[str] = None,
+    ) -> OrchestratorResult:
         final_state = self._agent_state_from_graph(final_graph_state)
+        pause_status = final_graph_state.get('pause_status')
+        if pause_status in ('needs_clarification', 'awaiting_human_feedback'):
+            phase = 'elicitation' if pause_status == 'needs_clarification' else 'human_collaboration'
+            intent = final_graph_state.get('research_intent') if isinstance(final_graph_state.get('research_intent'), dict) else None
+            questions = list((intent or {}).get('clarifying_questions') or [])
+            collab = final_graph_state.get('collaboration_prompt') or ''
+            session = self._session_store.create(
+                phase=phase,
+                graph_state=dict(final_graph_state),
+                research_intent=intent,
+                clarifying_questions=questions,
+                collaboration_prompt=collab,
+                interactive=interactive,
+                use_kg=use_kg,
+                compare_baseline=compare_baseline,
+                session_id=existing_session_id,
+            )
+            answer = collab if pause_status == 'awaiting_human_feedback' else self._format_clarification_answer(questions, intent)
+            return OrchestratorResult(
+                answer=answer,
+                state=final_state,
+                iterations_used=final_state.iteration,
+                status=pause_status,
+                session_id=session.session_id,
+                clarifying_questions=questions or None,
+                collaboration_prompt=collab or None,
+            )
         final_answer = final_graph_state.get('final_answer') or self._compose_final_answer(final_state, final_state.evidence_summary or '')
-        return OrchestratorResult(answer=final_answer, state=final_state, iterations_used=final_state.iteration)
+        return OrchestratorResult(
+            answer=final_answer,
+            state=final_state,
+            iterations_used=final_state.iteration,
+            status='complete',
+        )
+
+    @staticmethod
+    def _format_clarification_answer(questions: List[str], intent: Optional[Dict[str, Any]]) -> str:
+        lines = [
+            'Before I search the knowledge graph and literature, I need a clearer research focus.',
+            '',
+            'What this helps me do:',
+            '- Retrieve the right concepts and evidence',
+            '- Avoid a vague or off-target synthesis',
+        ]
+        refined = (intent or {}).get('refined_question') if isinstance(intent, dict) else None
+        if refined:
+            lines.extend(['', 'My current best guess of your question:', f'- {refined}'])
+        lines.extend(['', 'Please reply with short answers to:'])
+        if questions:
+            for i, q in enumerate(questions, 1):
+                lines.append(f'{i}. {q}')
+        else:
+            lines.append('1. What is your main research objective?')
+            lines.append('2. Which focal concept(s) should I prioritize?')
+            lines.append('3. What kind of output do you want (definition, relationships, proposition, gap)?')
+        lines.extend(
+            [
+                '',
+                'Tip: one short paragraph covering those points is enough.',
+            ]
+        )
+        return '\n'.join(lines)
+
+    @staticmethod
+    def _plain_analysis_labels(names: List[str]) -> List[str]:
+        labels = {
+            'related_publications': 'related publications',
+            'definitions': 'construct definitions',
+            'definition_similarity': 'compare definitions across sources',
+            'related_theories': 'related theories',
+            'antecedents_consequents': 'antecedents and consequents',
+            'mediators_moderators': 'mediators and moderators',
+            'indegreecentrality': 'most common consequents (in-degree)',
+            'outdegreecentrality': 'most common antecedents (out-degree)',
+            'betweennesscentrality': 'bridge concepts (betweenness)',
+            'cutpoints': 'cut-point concepts',
+            'periphery': 'peripheral / innovative concepts',
+            'structural_hole_measures': 'structural-hole measures',
+            'association_rules': 'concepts that co-occur in models',
+            'knowledge_index': 'knowledge-index / path convergence',
+        }
+        out: List[str] = []
+        for name in names:
+            if not isinstance(name, str) or not name.strip():
+                continue
+            key = name.strip()
+            if key.lower().startswith('follow_up:'):
+                continue
+            out.append(labels.get(key, key.replace('_', ' ')))
+        return out
+
+    @staticmethod
+    def _short_user_facing_text(text: str, *, max_chars: int = 260) -> str:
+        cleaned = ' '.join((text or '').strip().split())
+        if not cleaned:
+            return ''
+        # Prefer first 1–2 sentences for readability.
+        parts = []
+        buf = ''
+        for ch in cleaned:
+            buf += ch
+            if ch in '.!?' and len(buf.strip()) >= 40:
+                parts.append(buf.strip())
+                buf = ''
+                if len(parts) >= 2:
+                    break
+        summary = ' '.join(parts) if parts else cleaned
+        if len(summary) <= max_chars:
+            return summary
+        cut = summary[: max_chars - 1].rsplit(' ', 1)[0]
+        return (cut or summary[: max_chars - 1]).rstrip('.,;:') + '…'
+
+    @classmethod
+    def _format_collaboration_prompt(cls, *, reflection: Optional[Dict[str, Any]], integration_state: Optional[Dict[str, Any]]) -> str:
+        refl = reflection if isinstance(reflection, dict) else {}
+        integ = integration_state if isinstance(integration_state, dict) else {}
+
+        lines = [
+            'Checkpoint: I recommend gathering a bit more evidence before the final synthesis.',
+            '',
+            'You do not need to run any analyses yourself.',
+            'Choose an action below, or type a short focus instruction.',
+        ]
+
+        why = cls._short_user_facing_text(str(refl.get('rationale') or ''))
+        if why:
+            lines.extend(['', 'Why I paused:', f'- {why}'])
+
+        concepts = [str(c).strip() for c in (integ.get('emerging_concepts') or []) if str(c).strip()][:6]
+        if concepts:
+            lines.extend(['', 'Useful so far (emerging concepts):'])
+            for c in concepts:
+                lines.append(f'- {c}')
+
+        gaps = [str(g).strip() for g in (integ.get('theoretical_gaps') or []) if str(g).strip()][:4]
+        if gaps:
+            lines.extend(
+                [
+                    '',
+                    'Still missing from the literature evidence (not tasks for you):',
+                ]
+            )
+            for g in gaps:
+                lines.append(f'- {g}')
+
+        next_analyses = cls._plain_analysis_labels(list(refl.get('recommended_analyses') or [])[:4])
+        follow = (refl.get('follow_up_question') or '').strip()
+
+        lines.extend(['', 'What I need from you (pick one):'])
+        if next_analyses:
+            lines.append(
+                '1. Reply continue — I will search/analyze next for: '
+                + '; '.join(next_analyses)
+            )
+        else:
+            lines.append('1. Reply continue — I will run another evidence-gathering cycle')
+        lines.append('2. Reply stop — skip more search and move to reading suggestions + final package')
+        if follow:
+            short_follow = cls._short_user_facing_text(follow, max_chars=320)
+            lines.append(f'3. Or type a focus note answering: {short_follow}')
+        else:
+            lines.append(
+                '3. Or type a focus note (e.g., which concept, domain, or relationship to prioritize)'
+            )
+
+        lines.extend(
+            [
+                '',
+                'Quick guide:',
+                '- continue = keep searching',
+                '- stop = finish now',
+                '- free text = steer the next search (I still do the analyses)',
+            ]
+        )
+        return '\n'.join(lines)
 
     @staticmethod
     def _append_log(state: GraphState, line: str) -> List[str]:
@@ -354,8 +650,22 @@ class KGMultiAgentOrchestrator:
         already_run = [x for x in state.get('analysis_queue') or [] if x in allowed]
         completed = set(already_run)
         cycle_index = int(state.get('analysis_step', 0))
-        system = 'Select the SINGLE best next Analysaurus analysis function (by function_name). The catalog in analysis_capabilities lists each function_name and description. Choose functions by interpreting the MEANING and PURPOSE of each analysis description, not by lexical overlap with the question text. Use current state, prior analyses, and evidence summaries to decide what is most useful now. Avoid repeating analyses that were already run unless there is a strong reason from the evidence. Return JSON only with selected_analyses (first item is the next analysis), objective, rationale.'
-        user = json.dumps({'question': state['question'], 'cycle_index': cycle_index, 'already_run_analyses': already_run, 'analysis_capabilities': str(self.ANALYSIS_CAPABILITIES), 'analysis_brief': self._analysis_brief(state.get('analysis_report')), 'kg_rows_excerpt': _kg_snippets(list(state.get('last_records', []))), 'pdf_chunks_excerpt': _chunk_snippets(list(state.get('extracted_records', []))), 'context_memo': self._memo_window(state.get('integration_memo') or '', max_chars=2500)}, ensure_ascii=False, indent=2)
+        for cand in state.get('recommended_analyses') or []:
+            if isinstance(cand, str) and cand in allowed and cand not in completed:
+                return cand
+        system = 'Select the SINGLE best next Analysaurus analysis function (by function_name). The catalog in analysis_capabilities lists each function_name and description. Choose functions by interpreting the MEANING and PURPOSE of each analysis description, not by lexical overlap with the question text. Use research_intent, current state, prior analyses, and evidence summaries to decide what is most useful now. Avoid repeating analyses that were already run unless there is a strong reason from the evidence. Return JSON only with selected_analyses (first item is the next analysis), objective, rationale.'
+        user = json.dumps({
+            'question': self._effective_question(state),
+            'research_intent': state.get('research_intent') or {},
+            'cycle_index': cycle_index,
+            'already_run_analyses': already_run,
+            'recommended_by_reflection': list(state.get('recommended_analyses') or []),
+            'analysis_capabilities': str(self.ANALYSIS_CAPABILITIES),
+            'analysis_brief': self._analysis_brief(state.get('analysis_report')),
+            'kg_rows_excerpt': _kg_snippets(list(state.get('last_records', []))),
+            'pdf_chunks_excerpt': _chunk_snippets(list(state.get('extracted_records', []))),
+            'context_memo': self._memo_window(state.get('integration_memo') or '', max_chars=2500),
+        }, ensure_ascii=False, indent=2)
         try:
             out = complete_json(self._llm_client, model=self._model, system=system, user=user, schema_model=_AnalysisSelectionJson)
             raw = [x.strip() for x in out.selected_analyses if isinstance(x, str) and x.strip()]
@@ -368,9 +678,18 @@ class KGMultiAgentOrchestrator:
             logger.warning('Analysis selection LLM failed: %s: %s', type(exc).__name__, exc)
         return self._fallback_analysis_for_cycle(cycle_index, allowed, completed)
 
-    def _plan_kg(self, *, question: str, found_records: List[dict], integration_memo: str, selected_analyses: List[str], selected_levels: List[str], objective: str) -> RetrievalPlan:
-        system = 'You plan what to retrieve from a Neo4j knowledge graph (concepts, relations, publications) based on evidence found so far. Output JSON matching the required keys. Do not write Cypher.\n\n' + self.schema.prompt_fragment()
-        user = json.dumps({'user_question': question, 'evidence_excerpts': _chunk_snippets(found_records), 'selected_analyses': selected_analyses, 'selected_levels': selected_levels, 'cycle_objective': objective, 'running_context_memo': self._memo_window(integration_memo, max_chars=2200)}, ensure_ascii=False, indent=2)
+    def _plan_kg(self, *, question: str, found_records: List[dict], integration_memo: str, selected_analyses: List[str], selected_levels: List[str], objective: str, research_intent: Optional[Dict[str, Any]] = None, agent_memories: Optional[List[Dict[str, Any]]] = None) -> RetrievalPlan:
+        system = 'You plan what to retrieve from a Neo4j knowledge graph (concepts, relations, publications) based on the structured research intent and evidence found so far. Output JSON matching the required keys. Do not write Cypher.\n\n' + self.schema.prompt_fragment()
+        user = json.dumps({
+            'user_question': question,
+            'research_intent': research_intent or {},
+            'evidence_excerpts': _chunk_snippets(found_records),
+            'selected_analyses': selected_analyses,
+            'selected_levels': selected_levels,
+            'cycle_objective': objective,
+            'running_context_memo': self._memo_window(integration_memo, max_chars=2200),
+            'internalized_agent_memory': InternalizationAgent.format_for_prompt(list(agent_memories or [])),
+        }, ensure_ascii=False, indent=2)
         try:
             return complete_json(self._llm_client, model=self._model, system=system, user=user, schema_model=RetrievalPlan)
         except (json.JSONDecodeError, ValidationError) as exc:
@@ -378,12 +697,15 @@ class KGMultiAgentOrchestrator:
         except Exception as exc:
             logger.warning('KG plan LLM failed: %s: %s', type(exc).__name__, exc)
         q = question.lower()
-        rels = ['IS_ANTECEDENT_OF', 'IS_CONSEQUENT_OF'] if 'trust' in q else []
+        concepts = []
+        if isinstance(research_intent, dict):
+            concepts = list(research_intent.get('target_concepts') or [])
+        rels = ['IS_ANTECEDENT_OF', 'IS_CONSEQUENT_OF'] if ('trust' in q or any('trust' in str(c).lower() for c in concepts)) else []
         return RetrievalPlan(intent='Iterative fallback: explore structure and publication-linked chunks.', target_labels=['Publication', 'Chunk', 'Element'], key_properties={}, preferred_relationships=rels, search_hint='Use graph patterns and vector search over chunks as needed.')
 
-    def _plan_pdf(self, *, question: str, found_records: List[dict], integration_memo: str) -> str:
-        system = 'You decide what to search next in PDF text chunks (vector retrieval) based on evidence found so far (concepts, relations, definitions, DOIs, and other retrieved context). Return a focused natural-language retrieval_instruction for finding the most useful passages.'
-        user = json.dumps({'user_question': question, 'found_evidence_sample': _kg_snippets(found_records), 'running_context_memo': self._memo_window(integration_memo, max_chars=2200)}, ensure_ascii=False, indent=2)
+    def _plan_pdf(self, *, question: str, found_records: List[dict], integration_memo: str, research_intent: Optional[Dict[str, Any]] = None) -> str:
+        system = 'You decide what to search next in PDF text chunks (vector retrieval) based on the research intent and evidence found so far (concepts, relations, definitions, DOIs, and other retrieved context). Return a focused natural-language retrieval_instruction for finding the most useful passages.'
+        user = json.dumps({'user_question': question, 'research_intent': research_intent or {}, 'found_evidence_sample': _kg_snippets(found_records), 'running_context_memo': self._memo_window(integration_memo, max_chars=2200)}, ensure_ascii=False, indent=2)
         try:
             out = complete_json(self._llm_client, model=self._model, system=system, user=user, schema_model=_PdfChunkFocusJson)
             return out.retrieval_instruction.strip()
@@ -457,13 +779,58 @@ class KGMultiAgentOrchestrator:
         filtered = {k: v for k, v in report.items() if k in keys}
         return filtered or report
 
+    def _node_elicit(self, state: GraphState) -> GraphState:
+        self._emit('node=elicit start')
+        intent = self.elicitation.elicit(state.get('question', ''))
+        payload = intent.model_dump()
+        scratch = self._append_log(
+            state,
+            f"[elicitation] specified={intent.is_sufficiently_specified} discovery_type={intent.discovery_type!r} concepts={intent.target_concepts[:6]}",
+        )
+        if intent.clarifying_questions:
+            scratch.append(f'[elicitation] clarifying_questions={intent.clarifying_questions[:4]}')
+        memories = list(state.get('agent_memories') or [])
+        if memories:
+            scratch.append(f'[elicitation] agent_memories={len(memories)}')
+        interactive = bool(state.get('interactive'))
+        needs_pause = bool(interactive and intent.is_sufficiently_specified is False)
+        out: GraphState = {
+            'research_intent': payload,
+            'scratchpad': scratch,
+            'iteration': self._bump_iteration(state),
+            'pause_status': 'needs_clarification' if needs_pause else None,
+        }
+        if needs_pause:
+            out['final_answer'] = self._format_clarification_answer(list(intent.clarifying_questions or []), payload)
+            scratch.append('[elicitation] pause=needs_clarification')
+            out['scratchpad'] = scratch
+        self._emit('node=elicit done')
+        return out
+
+    def _route_after_elicit(self, state: GraphState) -> str:
+        if state.get('pause_status') == 'needs_clarification':
+            self._emit('route elicit -> pause_exit (needs_clarification)')
+            return 'pause_exit'
+        self._emit('route elicit -> interpret')
+        return 'interpret'
+
+    def _node_pause_exit(self, state: GraphState) -> GraphState:
+        self._emit(f"node=pause_exit status={state.get('pause_status')}")
+        return {}
+
     def _node_interpret(self, state: GraphState) -> GraphState:
         self._emit('node=interpret start')
-        interpretation = {'strategy': 'adaptive', 'note': 'No fixed query-type heuristic; planning is driven by iterative evidence.'}
+        intent = state.get('research_intent') or {}
+        interpretation = {
+            'strategy': 'adaptive',
+            'note': 'KDE flow: elicitation -> extraction pipeline -> integration/reflection -> vicarious learning.',
+            'discovery_type': intent.get('discovery_type') if isinstance(intent, dict) else None,
+            'refined_question': intent.get('refined_question') if isinstance(intent, dict) else None,
+        }
         self._emit('node=interpret done strategy=adaptive')
-        scratch = self._append_log(state, '[interpret] strategy=adaptive')
+        scratch = self._append_log(state, '[interpret] strategy=adaptive kde=true')
         scratch.append('[analysis_queue] empty at start; selector chooses next analysis each cycle')
-        return {'available_actions': list(self.ACTION_CATALOG.keys()), 'interpretation': interpretation, 'analysis_queue': [], 'analysis_step': 0, 'stop_gathering': False, 'selected_analyses': [], 'integration_memo': state.get('integration_memo', ''), 'scratchpad': scratch, 'iteration': self._bump_iteration(state), 'use_kg': bool(state.get('use_kg', self._use_kg))}
+        return {'available_actions': list(self.ACTION_CATALOG.keys()), 'interpretation': interpretation, 'analysis_queue': [], 'analysis_step': 0, 'stop_gathering': False, 'selected_analyses': [], 'integration_memo': state.get('integration_memo', ''), 'research_intent': state.get('research_intent'), 'scratchpad': scratch, 'iteration': self._bump_iteration(state), 'use_kg': bool(state.get('use_kg', self._use_kg))}
 
     def _route_after_interpret(self, state: GraphState) -> str:
         if bool(state.get('use_kg', self._use_kg)):
@@ -494,9 +861,18 @@ class KGMultiAgentOrchestrator:
         if not levels:
             levels = ['concept', 'relationship']
         objective = (state.get('current_objective') or '').strip() or self._cycle_objective({**state, 'selected_analyses': analyses})
-        plan = self._plan_kg(question=state['question'], found_records=list(state.get('extracted_records', [])), integration_memo=state.get('integration_memo', ''), selected_analyses=analyses, selected_levels=levels, objective=objective)
+        plan = self._plan_kg(
+            question=self._effective_question(state),
+            found_records=list(state.get('extracted_records', [])),
+            integration_memo=state.get('integration_memo', ''),
+            selected_analyses=analyses,
+            selected_levels=levels,
+            objective=objective,
+            research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
+            agent_memories=list(state.get('agent_memories') or []),
+        )
         plan = self._enrich_plan_with_objective(plan, objective, cycle, levels)
-        scratch = self._append_log(state, f'[plan_kg_from_context] cycle={cycle} objective={objective}')
+        scratch = self._append_log(state, f'[extraction_pipeline][plan_kg_from_context] cycle={cycle} objective={objective}')
         scratch.append(f'[plan_kg_from_context] selected_analyses={analyses} derived_levels={levels}')
         scratch.append(f'[plan_kg_from_context] intent={plan.intent!r}')
         self._emit('node=plan_kg_from_context done')
@@ -521,11 +897,15 @@ class KGMultiAgentOrchestrator:
 
     def _node_run_kg_query(self, state: GraphState) -> GraphState:
         self._emit('node=run_kg_query start')
-        question = state['question']
+        question = self._effective_question(state)
         question_embedding = state.get('question_embedding')
         rp = state.get('retrieval_plan') or {}
         plan = RetrievalPlan.model_validate(rp)
-        bundle = self.graph_query.propose_query(question, plan, question_embedding=question_embedding, extra_context=self._memo_window(state.get('integration_memo', ''), max_chars=1800))
+        intent_bit = ''
+        intent = state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None
+        if intent:
+            intent_bit = f" research_intent={json.dumps({k: intent.get(k) for k in ('objective', 'target_concepts', 'discovery_type')}, ensure_ascii=False)[:600]}"
+        bundle = self.graph_query.propose_query(question, plan, question_embedding=question_embedding, extra_context=self._memo_window(state.get('integration_memo', ''), max_chars=1800) + intent_bit)
         merged = dict(bundle.parameters)
         if question_embedding is not None:
             if 'embedding' not in merged and '$embedding' in bundle.cypher:
@@ -559,87 +939,172 @@ class KGMultiAgentOrchestrator:
 
     def _node_plan_pdf_from_kg(self, state: GraphState) -> GraphState:
         self._emit('node=plan_pdf_from_kg start')
-        objective = self._cycle_objective(state)
-        instruction = self._plan_pdf(question=state['question'], found_records=list(state.get('last_records', [])), integration_memo=state.get('integration_memo', ''))
-        scratch = self._append_log(state, f'[plan_pdf_from_kg] instruction={instruction[:120]!r}...')
+        instruction = self._plan_pdf(
+            question=self._effective_question(state),
+            found_records=list(state.get('last_records', [])),
+            integration_memo=state.get('integration_memo', ''),
+            research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
+        )
+        scratch = self._append_log(state, f'[extraction_pipeline][plan_pdf_from_kg] instruction={instruction[:120]!r}...')
         self._emit('node=plan_pdf_from_kg done')
         return {'pdf_focus_instruction': instruction, 'integration_memo': state.get('integration_memo', ''), 'scratchpad': scratch, 'iteration': self._bump_iteration(state)}
 
     def _node_pdf_refine(self, state: GraphState) -> GraphState:
         self._emit('node=pdf_refine start')
-        question = state['question']
+        question = self._effective_question(state)
         step = int(state.get('analysis_step', 0))
         instr = (state.get('pdf_focus_instruction') or question).strip()
         new_rows, note = self.extraction.extract_from_instruction(self._driver, instr, question=question, question_embedding=state.get('question_embedding'), fallback_records=list(state.get('last_records', [])))
         merged = self._merge_chunk_rows(list(state.get('extracted_records', [])), new_rows)
-        scratch = self._append_log(state, f'[pdf_refine] analysis_step={step} {note}')
+        scratch = self._append_log(state, f'[extraction_pipeline][pdf_refine] analysis_step={step} {note}')
         self._emit(f'node=pdf_refine done analysis_step={step} total_chunks={len(merged)}')
         return {'extracted_records': merged, 'cycle_index': step, 'integration_memo': state.get('integration_memo', ''), 'scratchpad': scratch, 'iteration': self._bump_iteration(state)}
 
+    def _node_build_cycle_knowledge_package(self, state: GraphState) -> GraphState:
+        self._emit('node=build_cycle_knowledge_package start')
+        cycle = int(state.get('analysis_step', 0))
+        chunk_summary = _chunk_snippets(list(state.get('extracted_records', [])), max_chunks=6, max_chars=500)
+        package = self.integration.build_cycle_package_from_extraction(
+            question=self._effective_question(state),
+            research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
+            kg_records=list(state.get('last_records', [])),
+            analysis_report=state.get('analysis_report') if isinstance(state.get('analysis_report'), dict) else None,
+            analysis_note=state.get('analysis_note') or '',
+            chunk_summary=chunk_summary,
+            cycle_index=cycle,
+            last_cypher=state.get('last_cypher'),
+        )
+        dump = package.model_dump()
+        packages = list(state.get('cycle_knowledge_packages') or [])
+        packages.append(dump)
+        scratch = self._append_log(
+            state,
+            f'[cycle_knowledge_package] stage={package.stage} concepts={len(package.key_concepts)} evidence={len(package.supporting_evidence)}',
+        )
+        self._emit('node=build_cycle_knowledge_package done')
+        return {
+            'current_cycle_package': dump,
+            'cycle_knowledge_packages': packages,
+            'scratchpad': scratch,
+            'iteration': self._bump_iteration(state),
+        }
+
     def _node_integrate_state(self, state: GraphState) -> GraphState:
         self._emit('node=integrate_state start')
-        out = self.integration.integrate(stage=f'cycle_{int(state.get('analysis_step', 0))}', question=state.get('question', ''), pdf_summary=_chunk_snippets(list(state.get('extracted_records', [])), max_chunks=8, max_chars=600), integration_memo=self._memo_window(state.get('integration_memo', ''), max_chars=5000), kg_records=list(state.get('last_records', [])), analysis_report=state.get('analysis_report'), analysis_note=state.get('analysis_note') or '')
+        prior = state.get('integration_state')
+        out = self.integration.integrate_knowledge(
+            stage=f'cycle_{int(state.get("analysis_step", 0))}',
+            question=self._effective_question(state),
+            research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
+            pdf_summary=_chunk_snippets(list(state.get('extracted_records', [])), max_chunks=8, max_chars=600),
+            prior_state=prior if isinstance(prior, dict) else None,
+            kg_records=list(state.get('last_records', [])),
+            analysis_report=state.get('analysis_report'),
+            analysis_note=state.get('analysis_note') or '',
+            cycle_package=state.get('current_cycle_package') if isinstance(state.get('current_cycle_package'), dict) else None,
+        )
         merged_context = (out.merged_context or '').strip()
         memo = merged_context or state.get('integration_memo', '')
+        integ_dump = out.model_dump()
         trace = list(state.get('integration_trace', []))
-        trace.append({'stage': out.stage or 'integrate_state', 'analysis_step': int(state.get('analysis_step', 0)), 'key_points': list(out.key_points or [])[:8], 'next_focus': (out.next_focus or '')[:300]})
-        scratch = self._append_log(state, f'[integrate_state] key_points={len(out.key_points or [])} next_focus={(out.next_focus or '')[:120]!r}')
+        trace.append({
+            'stage': out.stage or 'integrate_state',
+            'analysis_step': int(state.get('analysis_step', 0)),
+            'key_points': list(out.key_points or [])[:8],
+            'next_focus': (out.next_focus or '')[:300],
+            'emerging_concepts': list(out.emerging_concepts or [])[:8],
+            'confidence': out.confidence,
+        })
+        scratch = self._append_log(
+            state,
+            f'[integrate_state] concepts={len(out.emerging_concepts or [])} props={len(out.propositions or [])} confidence={out.confidence:.2f}',
+        )
         self._emit('node=integrate_state done')
-        return {'integration_memo': memo, 'integration_trace': trace, 'integration_note': out.next_focus or '', 'scratchpad': scratch, 'iteration': self._bump_iteration(state)}
-
-    def _checkpoint_evidence_block(self, state: GraphState) -> str:
-        q = (state.get('question') or '').strip()
-        memo = self._memo_window(state.get('integration_memo') or '', max_chars=3200)
-        ab = self._analysis_brief(state.get('analysis_report'))
-        chunks = _chunk_snippets(list(state.get('extracted_records', [])), max_chunks=6, max_chars=500)
-        kg = _kg_snippets(list(state.get('last_records', [])), max_rows=4, max_chars=400)
-        step = int(state.get('analysis_step', 0))
-        queue = list(state.get('analysis_queue') or [])
-        cur = queue[step] if queue and 0 <= step < len(queue) else '(unknown)'
-        return f'USER QUESTION (this is the only goal to satisfy):\n{q}\n\nCurrent analysis function for this iteration: {cur}\n\nRunning integration memo:\n{memo}\n\nAnalysis brief (this cycle):\n{ab or '(none)'}\n\nLatest graph sample:\n{kg}\n\nPDF chunks gathered so far (excerpt):\n{chunks}\n'
-
-    def _evaluate_sufficiency(self, state: GraphState) -> tuple[bool, str]:
-        """Ask the LLM whether evidence is sufficient. Returns (sufficient, rationale)."""
-        system = 'You judge whether the accumulated evidence answers the USER QUESTION. The user question is the sole success criterion — stay on topic. Answer sufficient=true only if a reasonable answer can be given from this evidence (definitions, relations, or PDF excerpts) without important gaps. If the evidence is empty, off-topic, or too weak, answer sufficient=false. Return JSON only with keys sufficient and rationale.'
-        user = self._checkpoint_evidence_block(state)
-        try:
-            out = complete_json(self._llm_client, model=self._model, system=system, user=user, schema_model=_CheckpointSufficiencyJson)
-            return bool(out.sufficient), (out.rationale or '').strip()
-        except (json.JSONDecodeError, ValidationError) as exc:
-            logger.debug('Checkpoint LLM returned invalid schema: %s', exc)
-            return False, 'Checkpoint LLM returned invalid JSON; continuing.'
-        except Exception as exc:
-            logger.warning('Checkpoint LLM failed: %s: %s', type(exc).__name__, exc)
-            return False, 'Checkpoint LLM failed; continuing if more analyses remain.'
+        return {
+            'integration_state': integ_dump,
+            'integration_memo': memo,
+            'integration_trace': trace,
+            'integration_note': out.next_focus or '',
+            'scratchpad': scratch,
+            'iteration': self._bump_iteration(state),
+        }
 
     def _node_checkpoint(self, state: GraphState) -> GraphState:
-        self._emit('node=checkpoint start')
+        """Reflection step: decide whether another Extraction Pipeline cycle is worthwhile."""
+        self._emit('node=checkpoint/reflection start')
         step = int(state.get('analysis_step', 0))
         next_step = step + 1
-        exhausted = next_step >= self._max_cycles
-
-        sufficient, rationale = self._evaluate_sufficiency(state)
-        should_stop = sufficient or exhausted
-
-        if sufficient:
-            self._emit('node=checkpoint done sufficient=True -> summarize')
-        elif exhausted:
-            self._emit(f'node=checkpoint done exhausted step={step} -> summarize')
+        allowed = sorted(self._allowed_analysis_function_names())
+        already_run = [x for x in (state.get('analysis_queue') or []) if x in self._allowed_analysis_function_names()]
+        decision = self.reflection_agent.reflect(
+            question=self._effective_question(state),
+            research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
+            integration_state=state.get('integration_state') if isinstance(state.get('integration_state'), dict) else None,
+            analysis_brief=self._analysis_brief(state.get('analysis_report')),
+            already_run_analyses=already_run,
+            allowed_analyses=allowed,
+            cycle_index=step,
+            max_cycles=self._max_cycles,
+            kg_excerpt=_kg_snippets(list(state.get('last_records', [])), max_rows=4, max_chars=350),
+            chunk_excerpt=_chunk_snippets(list(state.get('extracted_records', [])), max_chunks=5, max_chars=400),
+        )
+        should_stop = not bool(decision.continue_loop)
+        reflection_dump = decision.model_dump()
+        interactive = bool(state.get('interactive'))
+        await_human = bool(interactive and not should_stop)
+        collaboration_prompt = ''
+        if await_human:
+            collaboration_prompt = self._format_collaboration_prompt(
+                reflection=reflection_dump,
+                integration_state=state.get('integration_state') if isinstance(state.get('integration_state'), dict) else None,
+            )
+            self._emit('node=checkpoint/reflection done pause=awaiting_human_feedback')
+        elif should_stop:
+            self._emit('node=checkpoint/reflection done stop -> vicarious_learning')
         else:
-            self._emit(f'node=checkpoint done continue -> analysis_step={next_step}')
+            self._emit(f'node=checkpoint/reflection done continue -> analysis_step={next_step}')
         trace = list(state.get('integration_trace', []))
-        trace.append({'stage': 'checkpoint', 'analysis_step': step, 'sufficient': sufficient, 'exhausted': exhausted, 'rationale': rationale[:500]})
-        scratch = self._append_log(state, f'[checkpoint] sufficient={sufficient} exhausted={exhausted} next_step={next_step} stop={should_stop}')
-        out_state: GraphState = {'stop_gathering': should_stop, 'integration_memo': state.get('integration_memo', ''), 'scratchpad': scratch, 'integration_trace': trace, 'iteration': self._bump_iteration(state)}
-        if not should_stop:
+        trace.append({
+            'stage': 'reflection',
+            'analysis_step': step,
+            'sufficient': decision.sufficient,
+            'continue_loop': decision.continue_loop,
+            'recommended_analyses': list(decision.recommended_analyses or [])[:6],
+            'rationale': (decision.rationale or '')[:500],
+            'await_human_gate': await_human,
+        })
+        scratch = self._append_log(
+            state,
+            f'[reflection] sufficient={decision.sufficient} continue={decision.continue_loop} next={list(decision.recommended_analyses or [])[:4]} human_gate={await_human}',
+        )
+        out_state: GraphState = {
+            'stop_gathering': should_stop,
+            'reflection': reflection_dump,
+            'recommended_analyses': list(decision.recommended_analyses or []),
+            'integration_memo': state.get('integration_memo', ''),
+            'scratchpad': scratch,
+            'integration_trace': trace,
+            'iteration': self._bump_iteration(state),
+            'await_human_gate': await_human,
+            'pause_status': 'awaiting_human_feedback' if await_human else None,
+            'collaboration_prompt': collaboration_prompt or None,
+            'final_answer': collaboration_prompt if await_human else state.get('final_answer'),
+        }
+        if not should_stop and not await_human:
             out_state['analysis_step'] = next_step
+        elif not should_stop and await_human:
+            # analysis_step advances on human continue
+            out_state['analysis_step'] = step
         return out_state
 
     def _route_after_checkpoint(self, state: GraphState) -> str:
+        if state.get('pause_status') == 'awaiting_human_feedback' or state.get('await_human_gate'):
+            self._emit('route reflection -> pause_exit (awaiting_human_feedback)')
+            return 'pause_exit'
         if state.get('stop_gathering'):
-            self._emit('route checkpoint -> summarize_answer')
-            return 'summarize_answer'
-        self._emit('route checkpoint -> select_analysis')
+            self._emit('route reflection -> vicarious_learning')
+            return 'vicarious_learning'
+        self._emit('route reflection -> select_analysis')
         return 'select_analysis'
 
     def _prepare_analysis_for_summary(self, state: GraphState) -> tuple[Dict[str, Any] | None, str]:
@@ -650,62 +1115,172 @@ class KGMultiAgentOrchestrator:
             report, anote = self.analyzing.analyze(list(state.get('last_records', [])))
         return report, anote
 
-    def _build_final_answer(self, state: GraphState, summary_out: Any, integrated: Any, report: Any, anote: str) -> str:
-        """Compose the final answer text from integration and summary outputs."""
-        integrated_text = (integrated.merged_context or '').strip()
-        final_text = self.integration.compose_final_answer(
-            question=state.get('question', ''),
-            pdf_summary=summary_out.summary,
-            integration_memo=integrated_text or state.get('integration_memo', ''),
-            kg_records=list(state.get('last_records', [])),
-            analysis_report=report,
-            analysis_note=anote,
-        )
-        if not final_text.strip():
-            final_text = integrated_text or summary_out.summary
-        merged: GraphState = dict(state)
-        merged['evidence_summary'] = summary_out.summary
-        merged['summary_cited_dois'] = list(summary_out.cited_dois)
-        merged['analysis_report'] = report
-        merged['analysis_note'] = anote
-        merged['integration_memo'] = integrated_text or state.get('integration_memo', '')
-        agent_state = self._agent_state_from_graph(merged)
-        return self._ensure_question_anchor(
-            state.get('question', ''),
-            self._compose_final_answer(agent_state, final_text),
-        )
-
     def _node_summarize_answer(self, state: GraphState) -> GraphState:
+        """Baseline / lite summary path: summarize chunks and build a simplified IntegrationState."""
         self._emit('node=summarize_answer start')
         report, anote = self._prepare_analysis_for_summary(state)
-        summary_out = self.summarizing.summarize(list(state.get('extracted_records', [])), question=state.get('question', ''))
-        integrated = self.integration.integrate(
-            stage='final_answer',
-            question=state.get('question', ''),
+        question = self._effective_question(state)
+        summary_out = self.summarizing.summarize(list(state.get('extracted_records', [])), question=question)
+        integ = self.integration.integrate_knowledge(
+            stage='baseline_or_lite_summary',
+            question=question,
+            research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
             pdf_summary=summary_out.summary,
-            integration_memo=state.get('integration_memo', ''),
+            prior_state=state.get('integration_state') if isinstance(state.get('integration_state'), dict) else None,
             kg_records=list(state.get('last_records', [])),
             analysis_report=report,
             analysis_note=anote,
         )
-        integrated_text = (integrated.merged_context or '').strip()
-        final = self._build_final_answer(state, summary_out, integrated, report, anote)
-        memo = integrated_text or state.get('integration_memo', '')
+        memo = (integ.merged_context or '').strip() or state.get('integration_memo', '')
         scratch = self._append_log(state, f'[summarize] len={len(summary_out.summary)} dois={len(summary_out.cited_dois)}')
         trace = list(state.get('integration_trace', []))
-        trace.append({'stage': integrated.stage or 'final_answer', 'analysis_step': int(state.get('analysis_step', 0)), 'key_points': list(integrated.key_points or [])[:8], 'next_focus': (integrated.next_focus or '')[:300]})
+        trace.append({
+            'stage': integ.stage or 'baseline_or_lite_summary',
+            'analysis_step': int(state.get('analysis_step', 0)),
+            'key_points': list(integ.key_points or [])[:8],
+            'confidence': integ.confidence,
+        })
         self._emit('node=summarize_answer done')
-        return {'analysis_report': report, 'analysis_note': anote, 'evidence_summary': summary_out.summary, 'summary_cited_dois': list(summary_out.cited_dois), 'final_answer': final, 'integration_memo': memo, 'integration_trace': trace, 'integration_note': integrated.next_focus or '', 'scratchpad': scratch, 'iteration': self._bump_iteration(state)}
+        return {
+            'analysis_report': report,
+            'analysis_note': anote,
+            'evidence_summary': summary_out.summary,
+            'summary_cited_dois': list(summary_out.cited_dois),
+            'integration_state': integ.model_dump(),
+            'integration_memo': memo,
+            'integration_trace': trace,
+            'integration_note': integ.next_focus or '',
+            'scratchpad': scratch,
+            'iteration': self._bump_iteration(state),
+        }
+
+    def _node_vicarious_learning(self, state: GraphState) -> GraphState:
+        self._emit('node=vicarious_learning start')
+        # Ensure we have an evidence summary before packaging.
+        report = state.get('analysis_report')
+        anote = state.get('analysis_note') or ''
+        evidence_summary = state.get('evidence_summary') or ''
+        cited = list(state.get('summary_cited_dois') or [])
+        if not evidence_summary.strip():
+            report, anote = self._prepare_analysis_for_summary(state)
+            summary_out = self.summarizing.summarize(
+                list(state.get('extracted_records', [])),
+                question=self._effective_question(state),
+            )
+            evidence_summary = summary_out.summary
+            cited = list(summary_out.cited_dois)
+        integ_state = state.get('integration_state')
+        if not isinstance(integ_state, dict):
+            integ = self.integration.integrate_knowledge(
+                stage='pre_vicarious',
+                question=self._effective_question(state),
+                research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
+                pdf_summary=evidence_summary,
+                prior_state=None,
+                kg_records=list(state.get('last_records', [])),
+                analysis_report=report,
+                analysis_note=anote,
+            )
+            integ_state = integ.model_dump()
+        vic = self.vicarious.learn(
+            self._driver,
+            question=self._effective_question(state),
+            question_embedding=state.get('question_embedding'),
+            research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
+            integration_state=integ_state,
+            fallback_records=list(state.get('extracted_records', [])),
+        )
+        scratch = self._append_log(
+            state,
+            f'[vicarious_learning] readings={len(vic.reading_sequence)} studies={len(vic.illustrative_studies)} note={vic.note[:80]!r}',
+        )
+        self._emit('node=vicarious_learning done')
+        return {
+            'vicarious': vic.model_dump(),
+            'analysis_report': report,
+            'analysis_note': anote,
+            'evidence_summary': evidence_summary,
+            'summary_cited_dois': cited,
+            'integration_state': integ_state,
+            'scratchpad': scratch,
+            'iteration': self._bump_iteration(state),
+        }
+
+    def _node_build_knowledge_package(self, state: GraphState) -> GraphState:
+        self._emit('node=build_knowledge_package start')
+        integ = state.get('integration_state')
+        if not isinstance(integ, dict):
+            # Baseline path may skip vicarious but still need a package.
+            lite = IntegrationState(
+                stage='package_fallback',
+                merged_context=state.get('integration_memo') or state.get('evidence_summary') or '',
+                key_points=[],
+                confidence=0.2,
+            )
+            integ = lite.model_dump()
+        package = self.integration.build_knowledge_package(
+            question=self._effective_question(state) or state.get('question', ''),
+            research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
+            integration_state=integ,
+            evidence_summary=state.get('evidence_summary') or '',
+            cited_dois=list(state.get('summary_cited_dois') or []),
+            vicarious=state.get('vicarious') if isinstance(state.get('vicarious'), dict) else None,
+            reflection=state.get('reflection') if isinstance(state.get('reflection'), dict) else None,
+            last_cypher=state.get('last_cypher'),
+            analysis_note=state.get('analysis_note') or '',
+            stage='final',
+        )
+        markdown = render_knowledge_package_markdown(package)
+        question = state.get('question', '')
+        final = self._ensure_question_anchor(question, markdown)
+        internalization_result: Dict[str, Any] | None = None
+        try:
+            embedding = state.get('question_embedding')
+            if embedding is None and question:
+                embedding = self._embed_fn([question])[0]
+            internalization_result = self.internalization.persist(
+                package=package,
+                research_intent=state.get('research_intent') if isinstance(state.get('research_intent'), dict) else None,
+                embedding=list(embedding) if embedding else None,
+                question=question,
+            )
+        except Exception as exc:
+            internalization_result = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+        scratch = self._append_log(
+            state,
+            f'[knowledge_package] concepts={len(package.key_concepts)} props={len(package.candidate_propositions)} confidence={package.confidence:.2f}',
+        )
+        if internalization_result:
+            scratch.append(f'[internalization] {internalization_result}')
+        self._emit('node=build_knowledge_package done')
+        return {
+            'knowledge_package': package.model_dump(),
+            'final_answer': final,
+            'integration_state': integ,
+            'internalization_result': internalization_result,
+            'scratchpad': scratch,
+            'iteration': self._bump_iteration(state),
+            'pause_status': None,
+            'await_human_gate': False,
+        }
 
     def _node_finalize(self, state: GraphState) -> GraphState:
         self._emit('node=finalize')
         if state.get('final_answer'):
             return {}
+        pkg = state.get('knowledge_package')
+        if isinstance(pkg, dict):
+            try:
+                from .models import KnowledgePackage
+                return {'final_answer': render_knowledge_package_markdown(KnowledgePackage.model_validate(pkg))}
+            except Exception:
+                pass
         fallback = state.get('evidence_summary') or 'No sufficient evidence gathered.'
         return {'final_answer': fallback}
 
     def _build_graph(self):
         graph = StateGraph(GraphState)
+        graph.add_node('elicit', self._node_elicit)
         graph.add_node('interpret', self._node_interpret)
         graph.add_node('baseline_retrieve', self._node_baseline_retrieve)
         graph.add_node('select_analysis', self._node_select_analysis)
@@ -714,26 +1289,84 @@ class KGMultiAgentOrchestrator:
         graph.add_node('run_analysis', self._node_run_analysis)
         graph.add_node('plan_pdf_from_kg', self._node_plan_pdf_from_kg)
         graph.add_node('pdf_refine', self._node_pdf_refine)
+        graph.add_node('build_cycle_knowledge_package', self._node_build_cycle_knowledge_package)
         graph.add_node('integrate_state', self._node_integrate_state)
         graph.add_node('checkpoint', self._node_checkpoint)
+        graph.add_node('vicarious_learning', self._node_vicarious_learning)
         graph.add_node('summarize_answer', self._node_summarize_answer)
+        graph.add_node('build_knowledge_package', self._node_build_knowledge_package)
         graph.add_node('finalize', self._node_finalize)
-        graph.add_edge(START, 'interpret')
-        graph.add_conditional_edges('interpret', self._route_after_interpret, {'select_analysis': 'select_analysis', 'baseline_retrieve': 'baseline_retrieve'})
+        graph.add_node('pause_exit', self._node_pause_exit)
+
+        def _route_entry(state: GraphState) -> str:
+            resume = (state.get('resume_from') or '').strip()
+            if resume in {
+                'elicit',
+                'interpret',
+                'select_analysis',
+                'vicarious_learning',
+                'baseline_retrieve',
+            }:
+                self._emit(f'route START -> {resume} (resume)')
+                return resume
+            self._emit('route START -> elicit')
+            return 'elicit'
+
+        graph.add_conditional_edges(
+            START,
+            _route_entry,
+            {
+                'elicit': 'elicit',
+                'interpret': 'interpret',
+                'select_analysis': 'select_analysis',
+                'vicarious_learning': 'vicarious_learning',
+                'baseline_retrieve': 'baseline_retrieve',
+            },
+        )
+        graph.add_conditional_edges(
+            'elicit',
+            self._route_after_elicit,
+            {'interpret': 'interpret', 'pause_exit': 'pause_exit'},
+        )
+        graph.add_conditional_edges(
+            'interpret',
+            self._route_after_interpret,
+            {'select_analysis': 'select_analysis', 'baseline_retrieve': 'baseline_retrieve'},
+        )
         graph.add_edge('baseline_retrieve', 'summarize_answer')
+        graph.add_edge('summarize_answer', 'build_knowledge_package')
         graph.add_edge('select_analysis', 'plan_kg_from_context')
         graph.add_edge('plan_kg_from_context', 'run_kg_query')
         graph.add_edge('run_kg_query', 'run_analysis')
         graph.add_edge('run_analysis', 'plan_pdf_from_kg')
         graph.add_edge('plan_pdf_from_kg', 'pdf_refine')
-        graph.add_edge('pdf_refine', 'integrate_state')
+        graph.add_edge('pdf_refine', 'build_cycle_knowledge_package')
+        graph.add_edge('build_cycle_knowledge_package', 'integrate_state')
         graph.add_edge('integrate_state', 'checkpoint')
-        graph.add_conditional_edges('checkpoint', self._route_after_checkpoint, {'select_analysis': 'select_analysis', 'summarize_answer': 'summarize_answer'})
-        graph.add_edge('summarize_answer', 'finalize')
+        graph.add_conditional_edges(
+            'checkpoint',
+            self._route_after_checkpoint,
+            {
+                'select_analysis': 'select_analysis',
+                'vicarious_learning': 'vicarious_learning',
+                'pause_exit': 'pause_exit',
+            },
+        )
+        graph.add_edge('vicarious_learning', 'build_knowledge_package')
+        graph.add_edge('build_knowledge_package', 'finalize')
         graph.add_edge('finalize', END)
+        graph.add_edge('pause_exit', END)
         return graph.compile()
 
-    def run(self, question: str, *, question_embedding: Optional[List[float]]=None, use_kg: Optional[bool]=None, compare_baseline: bool=False) -> OrchestratorResult:
+    def run(
+        self,
+        question: str,
+        *,
+        question_embedding: Optional[List[float]] = None,
+        use_kg: Optional[bool] = None,
+        compare_baseline: bool = False,
+        interactive: bool = False,
+    ) -> OrchestratorResult:
         """Run the orchestrator pipeline.
 
         Args:
@@ -743,14 +1376,112 @@ class KGMultiAgentOrchestrator:
             compare_baseline: If True AND use_kg is enabled, also run a no-KG
                 baseline and return both answers side-by-side. Defaults to False
                 to avoid doubling latency and API cost.
+            interactive: If True, pause for clarification / human collaboration gates.
         """
         self._emit('run start')
         effective_use_kg = self._use_kg if use_kg is None else bool(use_kg)
-        primary = self._run_single(question=question, question_embedding=question_embedding, use_kg=effective_use_kg)
-        if effective_use_kg and compare_baseline:
-            baseline = self._run_single(question=question, question_embedding=question_embedding, use_kg=False)
-            combined_answer = f'Question: {question}\n\nVersion A (KG-augmented):\n{primary.answer.strip()}\n\nVersion B (No-KG baseline):\n{baseline.answer.strip()}'
-            self._emit(f'run done iterations_kg={primary.iterations_used} iterations_baseline={baseline.iterations_used}')
-            return OrchestratorResult(answer=combined_answer, state=primary.state, iterations_used=primary.iterations_used + baseline.iterations_used)
+        primary = self._run_single(
+            question=question,
+            question_embedding=question_embedding,
+            use_kg=effective_use_kg,
+            interactive=interactive,
+        )
+        if primary.status != 'complete':
+            self._emit(f'run paused status={primary.status} session={primary.session_id}')
+            return primary
+        if effective_use_kg and compare_baseline and not interactive:
+            baseline = self._run_single(
+                question=question,
+                question_embedding=question_embedding,
+                use_kg=False,
+                interactive=False,
+            )
+            combined_answer = (
+                f'Question: {question}\n\nVersion A (KG-augmented):\n{primary.answer.strip()}\n\n'
+                f'Version B (No-KG baseline):\n{baseline.answer.strip()}'
+            )
+            self._emit(
+                f'run done iterations_kg={primary.iterations_used} iterations_baseline={baseline.iterations_used}'
+            )
+            return OrchestratorResult(
+                answer=combined_answer,
+                state=primary.state,
+                iterations_used=primary.iterations_used + baseline.iterations_used,
+                status='complete',
+            )
         self._emit(f'run done iterations={primary.iterations_used}')
         return primary
+
+    def continue_session(
+        self,
+        *,
+        session_id: str,
+        clarification_answers: Optional[str] = None,
+        human_feedback: Optional[str] = None,
+        question_embedding: Optional[List[float]] = None,
+    ) -> OrchestratorResult:
+        session = self._session_store.pop(session_id)
+        if session is None:
+            raise ValueError(f'Unknown or expired session_id: {session_id}')
+        state = dict(session.graph_state)
+        state['pause_status'] = None
+        state['await_human_gate'] = False
+        state['collaboration_prompt'] = None
+        state['interactive'] = session.interactive
+        if question_embedding is not None:
+            state['question_embedding'] = question_embedding
+
+        if session.phase == 'elicitation':
+            answers = (clarification_answers or human_feedback or '').strip()
+            if not answers:
+                raise ValueError('clarification_answers required to continue elicitation.')
+            base_q = state.get('question') or ''
+            merged_prompt = (
+                f'{base_q}\n\nClarifications from researcher:\n{answers}\n\n'
+                f'Prior clarifying questions: {session.clarifying_questions}'
+            )
+            intent = self.elicitation.elicit(merged_prompt)
+            # After clarification, proceed even if still imperfectly specified.
+            intent = intent.model_copy(update={'is_sufficiently_specified': True})
+            state['research_intent'] = intent.model_dump()
+            state['question'] = intent.refined_question or base_q
+            if state.get('question_embedding') is None and state['question']:
+                state['question_embedding'] = self._embed_fn([state['question']])[0]
+            state['resume_from'] = 'interpret'
+            scratch = list(state.get('scratchpad') or [])
+            scratch.append(f'[elicitation_resume] answers={answers[:300]!r}')
+            state['scratchpad'] = scratch
+        elif session.phase == 'human_collaboration':
+            feedback = (human_feedback or clarification_answers or 'continue').strip()
+            fb_lower = feedback.lower()
+            step = int(state.get('analysis_step', 0))
+            if fb_lower in {'stop', 'done', 'finish', 'sufficient'}:
+                state['stop_gathering'] = True
+                state['resume_from'] = 'vicarious_learning'
+                scratch = list(state.get('scratchpad') or [])
+                scratch.append('[human_collaboration] decision=stop')
+                state['scratchpad'] = scratch
+            else:
+                state['stop_gathering'] = False
+                state['analysis_step'] = step + 1
+                state['human_feedback'] = feedback
+                memo = state.get('integration_memo') or ''
+                if fb_lower not in {'continue', 'yes', 'y', 'ok', 'proceed'}:
+                    memo = f'{memo}\n[human_feedback] {feedback}'.strip()
+                    state['integration_note'] = feedback[:300]
+                state['integration_memo'] = memo
+                state['resume_from'] = 'select_analysis'
+                scratch = list(state.get('scratchpad') or [])
+                scratch.append(f'[human_collaboration] decision=continue feedback={feedback[:200]!r}')
+                state['scratchpad'] = scratch
+        else:
+            raise ValueError(f'Unsupported session phase: {session.phase}')
+
+        final_graph_state = self._graph.invoke(state)
+        return self._result_from_graph_state(
+            final_graph_state,
+            interactive=session.interactive,
+            use_kg=session.use_kg,
+            compare_baseline=session.compare_baseline,
+            existing_session_id=None,
+        )

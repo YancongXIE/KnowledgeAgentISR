@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 from dotenv import load_dotenv
 from neo4j import Driver, GraphDatabase
 
+from .integration_agent import render_knowledge_package_markdown
 from .orchestrator import AzureOpenAIClient, KGMultiAgentOrchestrator, OrchestratorResult
 from .pdf_context import summarize_sources
 from .state import AgentState
@@ -56,6 +57,7 @@ class AgentRuntime:
         use_kg: Optional[bool] = None,
         compare_baseline: bool = False,
         document_records: Optional[List[Dict[str, Any]]] = None,
+        interactive: bool = False,
     ) -> OrchestratorResult:
         cleaned_question = question.strip()
         if not cleaned_question:
@@ -72,6 +74,23 @@ class AgentRuntime:
             question_embedding=question_embedding,
             use_kg=use_kg,
             compare_baseline=compare_baseline,
+            interactive=interactive,
+        )
+
+    def continue_ask(
+        self,
+        *,
+        session_id: str,
+        clarification_answers: Optional[str] = None,
+        human_feedback: Optional[str] = None,
+    ) -> OrchestratorResult:
+        sid = (session_id or "").strip()
+        if not sid:
+            raise ValueError("session_id is required.")
+        return self.orchestrator.continue_session(
+            session_id=sid,
+            clarification_answers=clarification_answers,
+            human_feedback=human_feedback,
         )
 
     def close(self) -> None:
@@ -87,33 +106,48 @@ class AgentRuntime:
         if not document_records:
             raise ValueError("No document content was available after parsing the uploaded PDFs.")
 
+        intent = self.orchestrator.elicitation.elicit(question)
         summary_out = self.orchestrator.summarizing.summarize(
             document_records,
-            question=question,
+            question=intent.refined_question or question,
             max_records_in_prompt=20,
             max_chars_per_record=2200,
         )
         source_names = summarize_sources(document_records) or "uploaded PDF files"
-        analysis_note = f"Answer grounded in uploaded PDF evidence from: {source_names}."
-        integrated = self.orchestrator.integration.integrate(
+        analysis_note = f"Answer grounded in uploaded PDF evidence from: {source_names}. KG extraction unavailable."
+        integ = self.orchestrator.integration.integrate_knowledge(
             stage="uploaded_pdf_context",
-            question=question,
+            question=intent.refined_question or question,
+            research_intent=intent,
             pdf_summary=summary_out.summary,
-            integration_memo="",
+            prior_state=None,
             kg_records=[],
             analysis_report=None,
             analysis_note=analysis_note,
             max_kg_rows=0,
         )
-        final_answer = self.orchestrator.integration.compose_final_answer(
-            question=question,
-            pdf_summary=summary_out.summary,
-            integration_memo=integrated.merged_context,
-            kg_records=[],
-            analysis_report=None,
+        package = self.orchestrator.integration.build_knowledge_package(
+            question=intent.refined_question or question,
+            research_intent=intent,
+            integration_state=integ,
+            evidence_summary=summary_out.summary,
+            cited_dois=list(summary_out.cited_dois),
+            vicarious=None,
+            reflection=None,
+            last_cypher=None,
             analysis_note=analysis_note,
-            max_kg_rows=0,
+            stage="final",
         )
+        # Mark KG-dependent sections as unavailable for upload-only path.
+        package = package.model_copy(
+            update={
+                "research_gaps": list(package.research_gaps)
+                + (["KG-backed gap analysis unavailable for uploaded-PDF-only path."] if not package.research_gaps else []),
+                "recommended_qualitative_readings": list(package.recommended_qualitative_readings)
+                or ["Vicarious learning (KG qualitative retrieval) unavailable for uploaded-PDF-only path."],
+            }
+        )
+        final_answer = render_knowledge_package_markdown(package)
         state = AgentState(
             question=question,
             question_embedding=question_embedding,
@@ -121,7 +155,10 @@ class AgentRuntime:
             analysis_note=analysis_note,
             evidence_summary=summary_out.summary,
             summary_cited_dois=list(summary_out.cited_dois),
-            integration_memo=integrated.merged_context,
+            integration_memo=integ.merged_context,
+            integration_state=integ.model_dump(),
+            research_intent=intent.model_dump(),
+            knowledge_package=package.model_dump(),
             integration_trace=[
                 {
                     "stage": "uploaded_pdf_context",
